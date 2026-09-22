@@ -16,9 +16,14 @@ import {
 export default function App() {
   // The list of drivers that have been added so far.
   // Each driver is an object like
-  // { id, name, destination, departureTime, seats, matchedRiders }.
-  // matchedRiders collects { id, name } for every rider matched to this ride so far.
+  // { id, name, destination, departureTime, seats, matchedRiders, pendingRequests }.
+  // seats is the number of AVAILABLE seats; it only goes down when a request is accepted.
+  // matchedRiders collects { id, name } for every confirmed passenger on this ride.
+  // pendingRequests collects { id, riderId, name } for requests the driver hasn't answered yet.
   const [drivers, setDrivers] = useState([]);
+
+  // Spike: a short message about the last request action (or why one was blocked).
+  const [requestNotice, setRequestNotice] = useState('');
 
   // Whether the "Add Driver" form is currently showing.
   const [isAddingDriver, setIsAddingDriver] = useState(false);
@@ -104,6 +109,7 @@ export default function App() {
       departureTime: trimmedDepartureTime,
       seats: seatsNumber,
       matchedRiders: [],
+      pendingRequests: [],
     };
     setDrivers([...drivers, newDriver]);
 
@@ -113,12 +119,14 @@ export default function App() {
   // Opens the Ride Details screen for a driver. This is the Available Rides -> Ride Details step.
   function handleViewRideDetails(driverId) {
     setSelectedRideDriverId(driverId);
+    setRequestNotice('');
   }
 
   // Closes the Ride Details screen (and any in-progress matching) and returns to Available Rides.
   function handleBackToAvailableRides() {
     setSelectedRideDriverId(null);
     setReservingDriverId(null);
+    setRequestNotice('');
   }
 
   // Cancels an offered ride: removes it from Available Rides and clears any
@@ -128,6 +136,7 @@ export default function App() {
     setDrivers(drivers.filter((driver) => driver.id !== driverId));
     setSelectedRideDriverId(null);
     setReservingDriverId(null);
+    setRequestNotice('');
   }
 
   // Opens (or closes, if already open) the waiting-rider picker for a driver.
@@ -141,39 +150,92 @@ export default function App() {
     setReservingDriverId(null);
   }
 
-  // Runs when a waiting rider is chosen to fill a driver's open seat.
-  // Decreases that driver's seat count by 1 (never below 0), removes the
-  // matched rider from the waiting list, and shows a Match Confirmed screen.
-  // This is the Rider Waiting -> Matched step.
-  function handleMatchRider(driverId, riderId) {
-    const matchedDriver = drivers.find((driver) => driver.id === driverId);
-    const matchedRider = riders.find((rider) => rider.id === riderId);
+  // SPIKE, step 1: a waiting rider requests this specific ride.
+  // The request is stored on the driver as Pending. Seats do NOT change yet,
+  // and the rider stays in the waiting list (they could still request other rides).
+  function handleRequestRide(driverId, riderId) {
+    const driver = drivers.find((d) => d.id === driverId);
+    const rider = riders.find((r) => r.id === riderId);
+    if (!driver || !rider) {
+      return;
+    }
 
+    if (driver.seats < 1) {
+      setRequestNotice('This ride is full, so it is not accepting requests.');
+      return;
+    }
+    if (driver.matchedRiders.some((r) => r.id === riderId)) {
+      setRequestNotice(`${rider.name} is already a confirmed passenger on this ride.`);
+      return;
+    }
+    if (driver.pendingRequests.some((req) => req.riderId === riderId)) {
+      setRequestNotice(`${rider.name} already has a pending request for this ride.`);
+      return;
+    }
+
+    const newRequest = { id: Date.now(), riderId: rider.id, name: rider.name };
     setDrivers(
-      drivers.map((driver) =>
-        driver.id === driverId
-          ? {
-              ...driver,
-              seats: Math.max(0, driver.seats - 1),
-              matchedRiders: matchedRider
-                ? [...driver.matchedRiders, { id: matchedRider.id, name: matchedRider.name }]
-                : driver.matchedRiders,
-            }
-          : driver
+      drivers.map((d) =>
+        d.id === driverId ? { ...d, pendingRequests: [...d.pendingRequests, newRequest] } : d
       )
     );
-    setRiders(riders.filter((rider) => rider.id !== riderId));
     setReservingDriverId(null);
-    setSelectedRideDriverId(null);
+    setRequestNotice(`${rider.name}'s request is now Pending.`);
+  }
 
-    if (matchedDriver && matchedRider) {
-      setMatchConfirmation({
-        riderName: matchedRider.name,
-        driverName: matchedDriver.name,
-        destination: matchedDriver.destination,
-        departureTime: matchedDriver.departureTime,
-      });
+  // SPIKE, step 2a: the driver accepts a pending request.
+  // The rider becomes a confirmed passenger, available seats go down by 1,
+  // and the rider leaves the waiting list (their requests to other rides are dropped).
+  function handleAcceptRequest(driverId, requestId) {
+    const driver = drivers.find((d) => d.id === driverId);
+    const request = driver && driver.pendingRequests.find((req) => req.id === requestId);
+    if (!driver || !request) {
+      return;
     }
+
+    // Edge case: the ride filled up while this request was waiting.
+    if (driver.seats < 1) {
+      setRequestNotice('This ride is full. Deny the request or free up a seat first.');
+      return;
+    }
+
+    setDrivers(
+      drivers.map((d) => {
+        if (d.id === driverId) {
+          return {
+            ...d,
+            seats: d.seats - 1,
+            matchedRiders: [...d.matchedRiders, { id: request.riderId, name: request.name }],
+            pendingRequests: d.pendingRequests.filter((req) => req.id !== requestId),
+          };
+        }
+        return {
+          ...d,
+          pendingRequests: d.pendingRequests.filter((req) => req.riderId !== request.riderId),
+        };
+      })
+    );
+    setRiders(riders.filter((rider) => rider.id !== request.riderId));
+    setRequestNotice(`${request.name} accepted: now a confirmed passenger.`);
+  }
+
+  // SPIKE, step 2b: the driver denies a pending request.
+  // The request is removed; seats and confirmed passengers are unchanged.
+  function handleDenyRequest(driverId, requestId) {
+    const driver = drivers.find((d) => d.id === driverId);
+    const request = driver && driver.pendingRequests.find((req) => req.id === requestId);
+    if (!driver || !request) {
+      return;
+    }
+
+    setDrivers(
+      drivers.map((d) =>
+        d.id === driverId
+          ? { ...d, pendingRequests: d.pendingRequests.filter((req) => req.id !== requestId) }
+          : d
+      )
+    );
+    setRequestNotice(`${request.name}'s request was denied. Seats unchanged.`);
   }
 
   // Dismisses the Match Confirmed screen and returns to the normal home view.
@@ -346,13 +408,71 @@ export default function App() {
                 </View>
               </View>
 
+              {requestNotice !== '' && (
+                <View style={styles.noticeBox}>
+                  <Text style={styles.noticeText}>{requestNotice}</Text>
+                </View>
+              )}
+
+              <View style={styles.sectionHeaderRow}>
+                <View style={[styles.sectionAccent, styles.sectionAccentRider]} />
+                <Text style={styles.sectionTitle}>
+                  Pending requests ({detailsDriver.pendingRequests.length})
+                </Text>
+              </View>
+
+              {detailsDriver.pendingRequests.length === 0 ? (
+                <Text style={styles.detailsMatchedEmpty}>No pending requests.</Text>
+              ) : (
+                <View style={styles.pendingList}>
+                  {detailsDriver.pendingRequests.map((request) => (
+                    <View key={request.id} style={styles.pendingRow}>
+                      <View style={[styles.avatar, styles.riderAvatar, styles.riderPickAvatar]}>
+                        <Text style={styles.avatarText}>{getInitial(request.name)}</Text>
+                      </View>
+                      <View style={styles.pendingInfo}>
+                        <Text style={styles.riderPickName}>{request.name}</Text>
+                        <Text style={styles.pendingStatus}>Pending</Text>
+                      </View>
+                      <TouchableOpacity
+                        style={[
+                          styles.acceptButton,
+                          detailsDriver.seats === 0 && styles.rideCardButtonDisabled,
+                        ]}
+                        onPress={() => handleAcceptRequest(detailsDriver.id, request.id)}
+                        disabled={detailsDriver.seats === 0}
+                        activeOpacity={0.85}
+                      >
+                        <Text
+                          style={[
+                            styles.acceptButtonText,
+                            detailsDriver.seats === 0 && styles.rideCardButtonTextDisabled,
+                          ]}
+                        >
+                          {detailsDriver.seats === 0 ? 'Full' : 'Accept'}
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.denyButton}
+                        onPress={() => handleDenyRequest(detailsDriver.id, request.id)}
+                        activeOpacity={0.85}
+                      >
+                        <Text style={styles.denyButtonText}>Deny</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
+              )}
+
               <View style={styles.sectionHeaderRow}>
                 <View style={[styles.sectionAccent, styles.sectionAccentDriver]} />
-                <Text style={styles.sectionTitle}>Riders in this ride</Text>
+                <Text style={styles.sectionTitle}>
+                  Confirmed passengers ({detailsDriver.matchedRiders.length})
+                </Text>
               </View>
 
               {detailsDriver.matchedRiders.length === 0 ? (
-                <Text style={styles.detailsMatchedEmpty}>No riders matched yet.</Text>
+                <Text style={styles.detailsMatchedEmpty}>No confirmed passengers yet.</Text>
               ) : (
                 <View style={styles.riderChipRow}>
                   {detailsDriver.matchedRiders.map((rider) => (
@@ -370,10 +490,10 @@ export default function App() {
                 /* Rider Matching: choose which waiting rider fills the open seat */
                 <View style={styles.reservationPanel}>
                   <Text style={styles.reservationTitle}>
-                    Match a rider to {detailsDriver.name}&apos;s ride
+                    Request {detailsDriver.name}&apos;s ride
                   </Text>
                   <Text style={styles.reservationSubtitle}>
-                    Tap a waiting rider to confirm the match.
+                    Tap a waiting rider to send a request. The driver will accept or deny it.
                   </Text>
 
                   {riders.length === 0 ? (
@@ -383,14 +503,18 @@ export default function App() {
                       <TouchableOpacity
                         key={rider.id}
                         style={styles.riderPickRow}
-                        onPress={() => handleMatchRider(detailsDriver.id, rider.id)}
+                        onPress={() => handleRequestRide(detailsDriver.id, rider.id)}
                         activeOpacity={0.75}
                       >
                         <View style={[styles.avatar, styles.riderAvatar, styles.riderPickAvatar]}>
                           <Text style={styles.avatarText}>{getInitial(rider.name)}</Text>
                         </View>
                         <Text style={styles.riderPickName}>{rider.name}</Text>
-                        <Text style={styles.riderPickArrow}>›</Text>
+                        {detailsDriver.pendingRequests.some((req) => req.riderId === rider.id) ? (
+                          <Text style={styles.pendingStatus}>Pending</Text>
+                        ) : (
+                          <Text style={styles.riderPickArrow}>›</Text>
+                        )}
                       </TouchableOpacity>
                     ))
                   )}
@@ -405,7 +529,7 @@ export default function App() {
                 </View>
               ) : (
                 (() => {
-                  let reserveLabel = 'Match Rider';
+                  let reserveLabel = 'Request This Ride';
                   if (detailsDriver.seats === 0) {
                     reserveLabel = 'Full';
                   } else if (riders.length === 0) {
@@ -495,6 +619,10 @@ export default function App() {
                 <View style={styles.rideCardTimeBadge}>
                   <Text style={styles.rideCardTimeText}>Departs {driver.departureTime}</Text>
                 </View>
+
+                <Text style={styles.rideCardCounts}>
+                  {driver.pendingRequests.length} pending · {driver.matchedRiders.length} confirmed
+                </Text>
 
                 <View style={styles.rideCardButton}>
                   <Text style={styles.rideCardButtonText}>View Details</Text>
@@ -991,7 +1119,75 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 4,
     marginTop: 8,
-    marginBottom: 14,
+    marginBottom: 8,
+  },
+  rideCardCounts: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#8A93A3',
+    marginBottom: 12,
+  },
+
+  // Spike: request notice, pending request rows, accept / deny buttons
+  noticeBox: {
+    backgroundColor: '#EEF3FF',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#D6E2FE',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 16,
+  },
+  noticeText: {
+    fontSize: 13.5,
+    fontWeight: '600',
+    color: '#16213E',
+  },
+  pendingList: {
+    marginBottom: 18,
+  },
+  pendingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF8F0',
+    borderRadius: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#F7E3D1',
+  },
+  pendingInfo: {
+    flex: 1,
+  },
+  pendingStatus: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#F2994A',
+  },
+  acceptButton: {
+    backgroundColor: '#3B6EF5',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    marginLeft: 6,
+  },
+  acceptButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  denyButton: {
+    backgroundColor: '#FDECEC',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    marginLeft: 6,
+  },
+  denyButtonText: {
+    color: '#D64545',
+    fontSize: 13,
+    fontWeight: '700',
   },
   rideCardTimeText: {
     fontSize: 11.5,
