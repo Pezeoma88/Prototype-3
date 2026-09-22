@@ -1,18 +1,31 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
+  Alert,
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 
 // This is the home screen for CarpoolBoard.
 // Drivers can be added (with a name and seat count), riders can ask for a ride,
 // and a waiting rider can be matched to a driver's open seat.
+//
+// Accounts/roles are local-only for this class-day change (no networking or
+// Firebase): everyone signed in on this device shares the same `drivers` and
+// `riders` board state, and each person's account just decides whether they
+// see the Driver or Rider side of it. That split is what a real multi-device
+// build (one phone signed in as a Driver, another as a Rider) would plug into
+// later, once `drivers`/`riders` are backed by a real synced store instead of
+// local state.
 export default function App() {
   // The list of drivers that have been added so far.
   // Each driver is an object like
@@ -21,6 +34,20 @@ export default function App() {
   // matchedRiders collects { id, name } for every confirmed passenger on this ride.
   // pendingRequests collects { id, riderId, name } for requests the driver hasn't answered yet.
   const [drivers, setDrivers] = useState([]);
+
+  // Local accounts for this device: { id, name, role }. There is no backend,
+  // so "signing up" just remembers a name + role for the session, and
+  // "logging in" again with the same name reuses that same account. This is
+  // the seam a real auth system would slot into later.
+  const [accounts, setAccounts] = useState([]);
+
+  // The id of the account currently signed in, or null when signed out.
+  const [currentUserId, setCurrentUserId] = useState(null);
+
+  // The current text typed into the sign-in form, and the role toggle.
+  const [authNameInput, setAuthNameInput] = useState('');
+  const [authRole, setAuthRole] = useState('driver');
+  const [authError, setAuthError] = useState('');
 
   // Spike: a short message about the last request action (or why one was blocked).
   const [requestNotice, setRequestNotice] = useState('');
@@ -36,6 +63,13 @@ export default function App() {
 
   // A validation message to show under the form, if something is wrong.
   const [formError, setFormError] = useState('');
+
+  // True while a Save Driver press is being handled, so a fast double-tap
+  // can't post the same ride twice before the form has a chance to close.
+  const [isSubmittingDriver, setIsSubmittingDriver] = useState(false);
+
+  // Lets us scroll back to the top (Available Rides) after saving a ride.
+  const scrollViewRef = useRef(null);
 
   // The list of riders who need a ride so far.
   // Each rider is an object like { id, name }.
@@ -60,8 +94,49 @@ export default function App() {
   // The id of the driver whose Ride Details screen is currently open, or null if none.
   const [selectedRideDriverId, setSelectedRideDriverId] = useState(null);
 
-  // Opens the Add Driver form.
+  // The signed-in account, or null when nobody is signed in yet.
+  const currentUser = accounts.find((account) => account.id === currentUserId) || null;
+
+  // Runs when the user presses "Continue" on the sign-in screen. A name that
+  // matches an existing account logs back into it (keeping its original
+  // role); a new name creates a new local account with the chosen role.
+  function handleSignIn() {
+    const trimmedName = authNameInput.trim();
+    if (trimmedName === '') {
+      setAuthError('Please enter your name.');
+      return;
+    }
+
+    const existingAccount = accounts.find(
+      (account) => account.name.toLowerCase() === trimmedName.toLowerCase()
+    );
+
+    if (existingAccount) {
+      setCurrentUserId(existingAccount.id);
+    } else {
+      const newAccount = { id: Date.now(), name: trimmedName, role: authRole };
+      setAccounts([...accounts, newAccount]);
+      setCurrentUserId(newAccount.id);
+    }
+
+    setAuthNameInput('');
+    setAuthError('');
+  }
+
+  // Signs the current account out. The shared board (drivers/riders) is left
+  // untouched so the next person to sign in still sees the same board.
+  function handleSignOut() {
+    setCurrentUserId(null);
+    setIsAddingDriver(false);
+    setIsAddingRider(false);
+    setSelectedRideDriverId(null);
+    setReservingDriverId(null);
+    setRequestNotice('');
+  }
+
+  // Opens the Add Driver form, pre-filled with the signed-in driver's name.
   function handleAddDriver() {
+    setNameInput(currentUser ? currentUser.name : '');
     setIsAddingDriver(true);
   }
 
@@ -73,10 +148,16 @@ export default function App() {
     setDepartureTimeInput('');
     setSeatsInput('');
     setFormError('');
+    setIsSubmittingDriver(false);
   }
 
   // Runs when the user presses "Save Driver".
   function handleSaveDriver() {
+    // Guards against a fast double-tap posting the same ride twice.
+    if (isSubmittingDriver) {
+      return;
+    }
+
     const trimmedName = nameInput.trim();
     const trimmedDestination = destinationInput.trim();
     const trimmedDepartureTime = departureTimeInput.trim();
@@ -101,9 +182,12 @@ export default function App() {
       return;
     }
 
+    setIsSubmittingDriver(true);
+
     // Add the new driver to the list, keeping all the existing drivers.
     const newDriver = {
       id: Date.now(),
+      driverAccountId: currentUser.id,
       name: trimmedName,
       destination: trimmedDestination,
       departureTime: trimmedDepartureTime,
@@ -111,9 +195,13 @@ export default function App() {
       matchedRiders: [],
       pendingRequests: [],
     };
-    setDrivers([...drivers, newDriver]);
+    setDrivers((current) => [...current, newDriver]);
 
+    // Success: dismiss the keyboard, close/reset the form, and scroll back
+    // up so the new ride is visible in Available Rides right away.
+    Keyboard.dismiss();
     resetForm();
+    scrollViewRef.current?.scrollTo({ y: 0, animated: true });
   }
 
   // Opens the Ride Details screen for a driver. This is the Available Rides -> Ride Details step.
@@ -129,14 +217,34 @@ export default function App() {
     setRequestNotice('');
   }
 
-  // Cancels an offered ride: removes it from Available Rides and clears any
-  // Ride Details / Rider Matching state pointing at it. Other drivers and
-  // riders are untouched.
+  // Cancels/rescinds an offered ride: removes it from Available Rides and
+  // clears any Ride Details / Rider Matching state pointing at it. Other
+  // drivers and riders are untouched. Only the driver who posted the ride
+  // can rescind it, and we confirm first since this can't be undone.
   function handleCancelRide(driverId) {
-    setDrivers(drivers.filter((driver) => driver.id !== driverId));
-    setSelectedRideDriverId(null);
-    setReservingDriverId(null);
-    setRequestNotice('');
+    const driver = drivers.find((d) => d.id === driverId);
+    if (!driver || !currentUser || driver.driverAccountId !== currentUser.id) {
+      return;
+    }
+
+    Alert.alert(
+      'Cancel this ride?',
+      `This removes your ride to ${driver.destination} and can't be undone.`,
+      [
+        { text: 'Keep Ride', style: 'cancel' },
+        {
+          text: 'Cancel Ride',
+          style: 'destructive',
+          onPress: () => {
+            setDrivers((current) => current.filter((d) => d.id !== driverId));
+            setSelectedRideDriverId(null);
+            setReservingDriverId(null);
+            setRequestNotice('');
+          },
+        },
+      ],
+      { cancelable: true }
+    );
   }
 
   // Opens (or closes, if already open) the waiting-rider picker for a driver.
@@ -238,13 +346,56 @@ export default function App() {
     setRequestNotice(`${request.name}'s request was denied. Seats unchanged.`);
   }
 
+  // A confirmed rider gives up their seat: the seat re-opens on the ride
+  // (so a "Full" ride stops showing as Full), and they go back to Looking
+  // for a Ride so they can find another one. Only the rider themselves can
+  // cancel their own seat.
+  function handleCancelConfirmedSeat(driverId, riderId) {
+    const driver = drivers.find((d) => d.id === driverId);
+    const rider = driver && driver.matchedRiders.find((r) => r.id === riderId);
+    if (!driver || !rider || !currentUser || currentUser.id !== riderId) {
+      return;
+    }
+
+    Alert.alert(
+      'Cancel your seat?',
+      `You'll give up your confirmed seat on ${driver.name}'s ride to ${driver.destination}.`,
+      [
+        { text: 'Keep My Seat', style: 'cancel' },
+        {
+          text: 'Cancel Seat',
+          style: 'destructive',
+          onPress: () => {
+            setDrivers((current) =>
+              current.map((d) =>
+                d.id === driverId
+                  ? {
+                      ...d,
+                      seats: d.seats + 1,
+                      matchedRiders: d.matchedRiders.filter((r) => r.id !== riderId),
+                    }
+                  : d
+              )
+            );
+            setRiders((current) =>
+              current.some((r) => r.id === riderId) ? current : [...current, { id: riderId, name: rider.name }]
+            );
+            setRequestNotice(`${rider.name} canceled their seat. A seat is now open.`);
+          },
+        },
+      ],
+      { cancelable: true }
+    );
+  }
+
   // Dismisses the Match Confirmed screen and returns to the normal home view.
   function handleDismissMatchConfirmation() {
     setMatchConfirmation(null);
   }
 
-  // Opens the Need a Ride form.
+  // Opens the Need a Ride form, pre-filled with the signed-in rider's name.
   function handleNeedRide() {
+    setRiderNameInput(currentUser ? currentUser.name : '');
     setIsAddingRider(true);
   }
 
@@ -265,14 +416,52 @@ export default function App() {
       return;
     }
 
+    // Riders are tied to their account id, so re-saving (e.g. after already
+    // joining) just closes the form instead of adding a duplicate entry.
+    if (riders.some((rider) => rider.id === currentUser.id)) {
+      resetRiderForm();
+      return;
+    }
+
     // Add the new rider to the list, keeping all the existing riders.
     const newRider = {
-      id: Date.now(),
+      id: currentUser.id,
       name: trimmedName,
     };
-    setRiders([...riders, newRider]);
+    setRiders((current) => [...current, newRider]);
 
     resetRiderForm();
+  }
+
+  // A waiting rider stops looking for a ride: they leave the waiting list,
+  // and any pending requests they had out to drivers are withdrawn too.
+  function handleLeaveWaitlist(riderId) {
+    const rider = riders.find((r) => r.id === riderId);
+    if (!rider || !currentUser || currentUser.id !== riderId) {
+      return;
+    }
+
+    Alert.alert(
+      'Stop looking for a ride?',
+      'This also cancels any pending requests you have sent.',
+      [
+        { text: 'Stay on the List', style: 'cancel' },
+        {
+          text: 'Remove Me',
+          style: 'destructive',
+          onPress: () => {
+            setRiders((current) => current.filter((r) => r.id !== riderId));
+            setDrivers((current) =>
+              current.map((d) => ({
+                ...d,
+                pendingRequests: d.pendingRequests.filter((req) => req.riderId !== riderId),
+              }))
+            );
+          },
+        },
+      ],
+      { cancelable: true }
+    );
   }
 
   // Gets a single uppercase letter to show inside an avatar circle.
@@ -281,7 +470,111 @@ export default function App() {
   }
 
   const detailsDriver = drivers.find((driver) => driver.id === selectedRideDriverId) || null;
-  const showActionsRow = !isAddingDriver || !isAddingRider;
+  // Only the driver who posted a ride can manage it (accept/deny, cancel).
+  const isOwnerDriver =
+    currentUser !== null &&
+    currentUser.role === 'driver' &&
+    detailsDriver !== null &&
+    detailsDriver.driverAccountId === currentUser.id;
+  const showActionsRow = currentUser
+    ? currentUser.role === 'driver'
+      ? !isAddingDriver
+      : !isAddingRider
+    : false;
+
+  if (currentUser === null) {
+    // Sign-in screen: local-only accounts, no networking or persistence yet.
+    // Picking a name + role here is what a real login would set up; the rest
+    // of the app just reads currentUser.role to decide what to show.
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar style="light" />
+        <KeyboardAvoidingView
+          style={styles.authFlexWrap}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+            <ScrollView
+              contentContainerStyle={styles.authScrollContent}
+              keyboardShouldPersistTaps="handled"
+            >
+              <View style={styles.authHeader}>
+                <View style={styles.logoMark}>
+                  <Text style={styles.logoMarkText}>C</Text>
+                </View>
+                <Text style={styles.authTitle}>CarpoolBoard</Text>
+                <Text style={styles.authSubtitle}>Sign in to see the shared ride board.</Text>
+              </View>
+
+              <View style={styles.authCard}>
+                <Text style={styles.authLabel}>Your name</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="e.g. Jordan Smith"
+                  placeholderTextColor="#9AA3B2"
+                  value={authNameInput}
+                  onChangeText={setAuthNameInput}
+                  returnKeyType="done"
+                  onSubmitEditing={Keyboard.dismiss}
+                />
+
+                <Text style={styles.authLabel}>I am a...</Text>
+                <View style={styles.roleToggleRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.roleToggleButton,
+                      authRole === 'driver' && styles.roleToggleButtonActiveDriver,
+                    ]}
+                    onPress={() => setAuthRole('driver')}
+                    activeOpacity={0.85}
+                  >
+                    <Text
+                      style={[
+                        styles.roleToggleText,
+                        authRole === 'driver' && styles.roleToggleTextActive,
+                      ]}
+                    >
+                      Driver
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.roleToggleButton,
+                      authRole === 'rider' && styles.roleToggleButtonActiveRider,
+                    ]}
+                    onPress={() => setAuthRole('rider')}
+                    activeOpacity={0.85}
+                  >
+                    <Text
+                      style={[
+                        styles.roleToggleText,
+                        authRole === 'rider' && styles.roleToggleTextActive,
+                      ]}
+                    >
+                      Rider
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.authHint}>
+                  Already signed up? Enter the same name to log back in with your existing role.
+                </Text>
+
+                {authError !== '' && <Text style={styles.errorText}>{authError}</Text>}
+
+                <TouchableOpacity
+                  style={styles.saveDriverButton}
+                  onPress={handleSignIn}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.buttonText}>Continue</Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </TouchableWithoutFeedback>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -299,6 +592,25 @@ export default function App() {
           </View>
         </View>
 
+        <View style={styles.accountRow}>
+          <Text style={styles.accountText} numberOfLines={1}>
+            Signed in as <Text style={styles.accountTextStrong}>{currentUser.name}</Text>
+          </Text>
+          <View
+            style={[
+              styles.roleBadge,
+              currentUser.role === 'driver' ? styles.roleBadgeDriver : styles.roleBadgeRider,
+            ]}
+          >
+            <Text style={styles.roleBadgeText}>
+              {currentUser.role === 'driver' ? 'Driver' : 'Rider'}
+            </Text>
+          </View>
+          <TouchableOpacity onPress={handleSignOut} activeOpacity={0.7}>
+            <Text style={styles.logOutText}>Log Out</Text>
+          </TouchableOpacity>
+        </View>
+
         <View style={styles.statRow}>
           <View style={styles.statChip}>
             <Text style={styles.statChipNumber}>{drivers.length}</Text>
@@ -312,7 +624,17 @@ export default function App() {
         </View>
       </View>
 
-      <ScrollView style={styles.scrollArea} contentContainerStyle={styles.container}>
+      <KeyboardAvoidingView
+        style={styles.mainFlexWrap}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+      <ScrollView
+        ref={scrollViewRef}
+        style={styles.scrollArea}
+        contentContainerStyle={styles.container}
+        keyboardShouldPersistTaps="handled"
+      >
         {matchConfirmation ? (
           /* Match Confirmed screen: shown after a rider is matched to a driver */
           <View style={styles.confirmationWrap}>
@@ -404,7 +726,13 @@ export default function App() {
                 <View style={styles.confirmationDetailDivider} />
                 <View style={styles.confirmationDetailRow}>
                   <Text style={styles.confirmationDetailLabel}>Available Seats</Text>
-                  <Text style={styles.confirmationDetailValue}>{detailsDriver.seats}</Text>
+                  {detailsDriver.seats === 0 ? (
+                    <View style={styles.fullPill}>
+                      <Text style={styles.fullPillText}>Full</Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.confirmationDetailValue}>{detailsDriver.seats}</Text>
+                  )}
                 </View>
               </View>
 
@@ -434,31 +762,35 @@ export default function App() {
                         <Text style={styles.riderPickName}>{request.name}</Text>
                         <Text style={styles.pendingStatus}>Pending</Text>
                       </View>
-                      <TouchableOpacity
-                        style={[
-                          styles.acceptButton,
-                          detailsDriver.seats === 0 && styles.rideCardButtonDisabled,
-                        ]}
-                        onPress={() => handleAcceptRequest(detailsDriver.id, request.id)}
-                        disabled={detailsDriver.seats === 0}
-                        activeOpacity={0.85}
-                      >
-                        <Text
-                          style={[
-                            styles.acceptButtonText,
-                            detailsDriver.seats === 0 && styles.rideCardButtonTextDisabled,
-                          ]}
-                        >
-                          {detailsDriver.seats === 0 ? 'Full' : 'Accept'}
-                        </Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={styles.denyButton}
-                        onPress={() => handleDenyRequest(detailsDriver.id, request.id)}
-                        activeOpacity={0.85}
-                      >
-                        <Text style={styles.denyButtonText}>Deny</Text>
-                      </TouchableOpacity>
+                      {isOwnerDriver && (
+                        <>
+                          <TouchableOpacity
+                            style={[
+                              styles.acceptButton,
+                              detailsDriver.seats === 0 && styles.rideCardButtonDisabled,
+                            ]}
+                            onPress={() => handleAcceptRequest(detailsDriver.id, request.id)}
+                            disabled={detailsDriver.seats === 0}
+                            activeOpacity={0.85}
+                          >
+                            <Text
+                              style={[
+                                styles.acceptButtonText,
+                                detailsDriver.seats === 0 && styles.rideCardButtonTextDisabled,
+                              ]}
+                            >
+                              {detailsDriver.seats === 0 ? 'Full' : 'Accept'}
+                            </Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.denyButton}
+                            onPress={() => handleDenyRequest(detailsDriver.id, request.id)}
+                            activeOpacity={0.85}
+                          >
+                            <Text style={styles.denyButtonText}>Deny</Text>
+                          </TouchableOpacity>
+                        </>
+                      )}
                     </View>
                   ))}
                 </View>
@@ -475,98 +807,117 @@ export default function App() {
                 <Text style={styles.detailsMatchedEmpty}>No confirmed passengers yet.</Text>
               ) : (
                 <View style={styles.riderChipRow}>
-                  {detailsDriver.matchedRiders.map((rider) => (
-                    <View key={rider.id} style={styles.riderChip}>
-                      <View style={[styles.avatar, styles.riderChipAvatar]}>
-                        <Text style={styles.avatarText}>{getInitial(rider.name)}</Text>
-                      </View>
-                      <Text style={styles.riderChipName}>{rider.name}</Text>
-                    </View>
-                  ))}
-                </View>
-              )}
-
-              {reservingDriverId === detailsDriver.id ? (
-                /* Rider Matching: choose which waiting rider fills the open seat */
-                <View style={styles.reservationPanel}>
-                  <Text style={styles.reservationTitle}>
-                    Request {detailsDriver.name}&apos;s ride
-                  </Text>
-                  <Text style={styles.reservationSubtitle}>
-                    Tap a waiting rider to send a request. The driver will accept or deny it.
-                  </Text>
-
-                  {riders.length === 0 ? (
-                    <Text style={styles.emptyMessage}>No riders waiting.</Text>
-                  ) : (
-                    riders.map((rider) => (
-                      <TouchableOpacity
-                        key={rider.id}
-                        style={styles.riderPickRow}
-                        onPress={() => handleRequestRide(detailsDriver.id, rider.id)}
-                        activeOpacity={0.75}
-                      >
-                        <View style={[styles.avatar, styles.riderAvatar, styles.riderPickAvatar]}>
+                  {detailsDriver.matchedRiders.map((rider) => {
+                    const isSelf = currentUser.role === 'rider' && rider.id === currentUser.id;
+                    return (
+                      <View key={rider.id} style={styles.riderChip}>
+                        <View style={[styles.avatar, styles.riderChipAvatar]}>
                           <Text style={styles.avatarText}>{getInitial(rider.name)}</Text>
                         </View>
-                        <Text style={styles.riderPickName}>{rider.name}</Text>
-                        {detailsDriver.pendingRequests.some((req) => req.riderId === rider.id) ? (
-                          <Text style={styles.pendingStatus}>Pending</Text>
-                        ) : (
-                          <Text style={styles.riderPickArrow}>›</Text>
+                        <Text style={styles.riderChipName}>{rider.name}</Text>
+                        {isSelf && (
+                          <TouchableOpacity
+                            style={styles.riderChipLeaveButton}
+                            onPress={() => handleCancelConfirmedSeat(detailsDriver.id, rider.id)}
+                            activeOpacity={0.7}
+                          >
+                            <Text style={styles.riderChipLeaveText}>Leave</Text>
+                          </TouchableOpacity>
                         )}
-                      </TouchableOpacity>
-                    ))
-                  )}
-
-                  <TouchableOpacity
-                    style={styles.cancelButton}
-                    onPress={handleCancelReserve}
-                    activeOpacity={0.85}
-                  >
-                    <Text style={styles.cancelButtonText}>Cancel</Text>
-                  </TouchableOpacity>
+                      </View>
+                    );
+                  })}
                 </View>
-              ) : (
-                (() => {
-                  let reserveLabel = 'Request This Ride';
-                  if (detailsDriver.seats === 0) {
-                    reserveLabel = 'Full';
-                  } else if (riders.length === 0) {
-                    reserveLabel = 'No Riders';
-                  }
-                  const reserveDisabled = detailsDriver.seats === 0 || riders.length === 0;
-
-                  return (
-                    <TouchableOpacity
-                      style={[
-                        styles.saveDriverButton,
-                        reserveDisabled && styles.rideCardButtonDisabled,
-                      ]}
-                      onPress={() => handleStartReserve(detailsDriver.id)}
-                      disabled={reserveDisabled}
-                      activeOpacity={0.85}
-                    >
-                      <Text
-                        style={[
-                          styles.buttonText,
-                          reserveDisabled && styles.rideCardButtonTextDisabled,
-                        ]}
-                      >
-                        {reserveLabel}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })()
               )}
 
-              <TouchableOpacity
-                style={styles.cancelRideButton}
-                onPress={() => handleCancelRide(detailsDriver.id)}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.cancelRideButtonText}>Cancel Ride</Text>
-              </TouchableOpacity>
+              {currentUser.role === 'rider' &&
+                (reservingDriverId === detailsDriver.id ? (
+                  /* Rider Matching: the signed-in rider confirms their own request. */
+                  <View style={styles.reservationPanel}>
+                    <Text style={styles.reservationTitle}>
+                      Request {detailsDriver.name}&apos;s ride
+                    </Text>
+                    <Text style={styles.reservationSubtitle}>
+                      Send this request as {currentUser.name}. The driver will accept or deny it.
+                    </Text>
+
+                    <TouchableOpacity
+                      style={styles.saveRiderButton}
+                      onPress={() => handleRequestRide(detailsDriver.id, currentUser.id)}
+                      activeOpacity={0.85}
+                    >
+                      <Text style={styles.buttonText}>Confirm Request</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.cancelButton}
+                      onPress={handleCancelReserve}
+                      activeOpacity={0.85}
+                    >
+                      <Text style={styles.cancelButtonText}>Cancel</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  (() => {
+                    const alreadyConfirmed = detailsDriver.matchedRiders.some(
+                      (r) => r.id === currentUser.id
+                    );
+                    const alreadyPending = detailsDriver.pendingRequests.some(
+                      (req) => req.riderId === currentUser.id
+                    );
+
+                    let reserveLabel = 'Request This Ride';
+                    if (detailsDriver.seats === 0) {
+                      reserveLabel = 'Full';
+                    } else if (alreadyConfirmed) {
+                      reserveLabel = 'Already Confirmed';
+                    } else if (alreadyPending) {
+                      reserveLabel = 'Request Pending';
+                    }
+                    const reserveDisabled =
+                      detailsDriver.seats === 0 || alreadyConfirmed || alreadyPending;
+
+                    return (
+                      <TouchableOpacity
+                        style={[
+                          styles.saveDriverButton,
+                          reserveDisabled && styles.rideCardButtonDisabled,
+                        ]}
+                        onPress={() => {
+                          // Joins the shared waiting list automatically the first
+                          // time a rider requests a ride, using their own account.
+                          setRiders((current) =>
+                            current.some((r) => r.id === currentUser.id)
+                              ? current
+                              : [...current, { id: currentUser.id, name: currentUser.name }]
+                          );
+                          handleStartReserve(detailsDriver.id);
+                        }}
+                        disabled={reserveDisabled}
+                        activeOpacity={0.85}
+                      >
+                        <Text
+                          style={[
+                            styles.buttonText,
+                            reserveDisabled && styles.rideCardButtonTextDisabled,
+                          ]}
+                        >
+                          {reserveLabel}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })()
+                ))}
+
+              {isOwnerDriver && (
+                <TouchableOpacity
+                  style={styles.cancelRideButton}
+                  onPress={() => handleCancelRide(detailsDriver.id)}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.cancelRideButtonText}>Cancel Ride</Text>
+                </TouchableOpacity>
+              )}
             </View>
           </View>
         ) : (
@@ -600,13 +951,16 @@ export default function App() {
                       <Text style={styles.avatarText}>{getInitial(driver.name)}</Text>
                     </View>
                   </View>
-                  <View style={styles.seatBadge}>
-                    <Text style={styles.seatBadgeText}>
-                      {driver.seats} seat{driver.seats === 1 ? '' : 's'}
+                  <View style={[styles.seatBadge, driver.seats === 0 && styles.seatBadgeFull]}>
+                    <Text style={[styles.seatBadgeText, driver.seats === 0 && styles.seatBadgeTextFull]}>
+                      {driver.seats === 0 ? 'Full' : `${driver.seats} seat${driver.seats === 1 ? '' : 's'}`}
                     </Text>
                   </View>
                 </View>
 
+                {driver.driverAccountId === currentUser.id && (
+                  <Text style={styles.yourRideTag}>Your Ride</Text>
+                )}
                 <Text style={styles.rideCardName}>{driver.name}</Text>
 
                 <View style={styles.rideCardRouteRow}>
@@ -644,21 +998,33 @@ export default function App() {
           </View>
         ) : (
           <View style={styles.riderChipRow}>
-            {riders.map((rider) => (
-              <View key={rider.id} style={styles.riderChip}>
-                <View style={[styles.avatar, styles.riderAvatar, styles.riderChipAvatar]}>
-                  <Text style={styles.avatarText}>{getInitial(rider.name)}</Text>
+            {riders.map((rider) => {
+              const isSelf = currentUser.role === 'rider' && rider.id === currentUser.id;
+              return (
+                <View key={rider.id} style={styles.riderChip}>
+                  <View style={[styles.avatar, styles.riderAvatar, styles.riderChipAvatar]}>
+                    <Text style={styles.avatarText}>{getInitial(rider.name)}</Text>
+                  </View>
+                  <Text style={styles.riderChipName}>{rider.name}</Text>
+                  {isSelf && (
+                    <TouchableOpacity
+                      style={styles.riderChipLeaveButton}
+                      onPress={() => handleLeaveWaitlist(rider.id)}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={styles.riderChipLeaveText}>Remove</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
-                <Text style={styles.riderChipName}>{rider.name}</Text>
-              </View>
-            ))}
+              );
+            })}
           </View>
         )}
 
         {/* Primary actions: side-by-side quick-action cards */}
         {showActionsRow && (
           <View style={styles.actionsRow}>
-            {!isAddingDriver && (
+            {currentUser.role === 'driver' && !isAddingDriver && (
               <TouchableOpacity
                 style={[styles.actionCard, styles.actionCardDriver]}
                 onPress={handleAddDriver}
@@ -668,7 +1034,7 @@ export default function App() {
                 <Text style={styles.actionCardHint}>Have extra seats?</Text>
               </TouchableOpacity>
             )}
-            {!isAddingRider && (
+            {currentUser.role === 'rider' && !isAddingRider && (
               <TouchableOpacity
                 style={[styles.actionCard, styles.actionCardRider]}
                 onPress={handleNeedRide}
@@ -682,7 +1048,7 @@ export default function App() {
         )}
 
         {/* Add Driver form */}
-        {isAddingDriver && (
+        {currentUser.role === 'driver' && isAddingDriver && (
           <View style={styles.section}>
             <View style={styles.sectionHeaderRow}>
               <View style={[styles.sectionAccent, styles.sectionAccentDriver]} />
@@ -695,6 +1061,7 @@ export default function App() {
               placeholderTextColor="#9AA3B2"
               value={nameInput}
               onChangeText={setNameInput}
+              returnKeyType="next"
             />
 
             <TextInput
@@ -703,6 +1070,7 @@ export default function App() {
               placeholderTextColor="#9AA3B2"
               value={destinationInput}
               onChangeText={setDestinationInput}
+              returnKeyType="next"
             />
 
             <TextInput
@@ -711,25 +1079,36 @@ export default function App() {
               placeholderTextColor="#9AA3B2"
               value={departureTimeInput}
               onChangeText={setDepartureTimeInput}
+              returnKeyType="next"
             />
 
+            {/* iOS has no Return key on a number pad, but pairing
+                returnKeyType="done" with a number-pad keyboardType makes iOS
+                show its own native "Done" toolbar above the keyboard, which
+                fires onSubmitEditing below. That's what actually dismisses
+                the keyboard on a real device, so no custom accessory bar is
+                rendered here. Digits are filtered as typed so only whole
+                numbers land. */}
             <TextInput
               style={styles.input}
               placeholder="Available seats"
               placeholderTextColor="#9AA3B2"
               value={seatsInput}
-              onChangeText={setSeatsInput}
-              keyboardType="numeric"
+              onChangeText={(text) => setSeatsInput(text.replace(/[^0-9]/g, ''))}
+              keyboardType="number-pad"
+              returnKeyType="done"
+              onSubmitEditing={Keyboard.dismiss}
             />
 
             {formError !== '' && <Text style={styles.errorText}>{formError}</Text>}
 
             <TouchableOpacity
-              style={styles.saveDriverButton}
+              style={[styles.saveDriverButton, isSubmittingDriver && styles.rideCardButtonDisabled]}
               onPress={handleSaveDriver}
+              disabled={isSubmittingDriver}
               activeOpacity={0.85}
             >
-              <Text style={styles.buttonText}>Save Driver</Text>
+              <Text style={styles.buttonText}>Save Ride</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -743,7 +1122,7 @@ export default function App() {
         )}
 
         {/* Request a Ride form */}
-        {isAddingRider && (
+        {currentUser.role === 'rider' && isAddingRider && (
           <View style={styles.section}>
             <View style={styles.sectionHeaderRow}>
               <View style={[styles.sectionAccent, styles.sectionAccentRider]} />
@@ -782,6 +1161,8 @@ export default function App() {
         </>
         )}
       </ScrollView>
+      </TouchableWithoutFeedback>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
@@ -1428,5 +1809,163 @@ const styles = StyleSheet.create({
     color: '#4B5563',
     fontSize: 16,
     fontWeight: '600',
+  },
+
+  // Sign-in screen
+  authFlexWrap: {
+    flex: 1,
+  },
+  authScrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+    paddingVertical: 32,
+    backgroundColor: '#16213E',
+  },
+  authHeader: {
+    alignItems: 'center',
+    marginBottom: 28,
+  },
+  authTitle: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: '#fff',
+    marginTop: 14,
+  },
+  authSubtitle: {
+    fontSize: 13.5,
+    color: 'rgba(255, 255, 255, 0.65)',
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  authCard: {
+    backgroundColor: '#fff',
+    borderRadius: 22,
+    padding: 20,
+  },
+  authLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#5B6472',
+    marginBottom: 8,
+    marginTop: 4,
+  },
+  authHint: {
+    fontSize: 12,
+    color: '#8A93A3',
+    marginBottom: 16,
+  },
+  roleToggleRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 10,
+  },
+  roleToggleButton: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#DADFE6',
+    paddingVertical: 12,
+    alignItems: 'center',
+    backgroundColor: '#FAFBFC',
+  },
+  roleToggleButtonActiveDriver: {
+    backgroundColor: '#3B6EF5',
+    borderColor: '#3B6EF5',
+  },
+  roleToggleButtonActiveRider: {
+    backgroundColor: '#F2994A',
+    borderColor: '#F2994A',
+  },
+  roleToggleText: {
+    fontSize: 14.5,
+    fontWeight: '700',
+    color: '#5B6472',
+  },
+  roleToggleTextActive: {
+    color: '#fff',
+  },
+
+  // Signed-in account row (header)
+  accountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  accountText: {
+    flex: 1,
+    fontSize: 12.5,
+    color: 'rgba(255, 255, 255, 0.7)',
+  },
+  accountTextStrong: {
+    color: '#fff',
+    fontWeight: '700',
+  },
+  roleBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    marginRight: 10,
+  },
+  roleBadgeDriver: {
+    backgroundColor: 'rgba(59, 110, 245, 0.35)',
+  },
+  roleBadgeRider: {
+    backgroundColor: 'rgba(242, 153, 74, 0.35)',
+  },
+  roleBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#fff',
+  },
+  logOutText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: '#fff',
+  },
+
+  // Wraps the scrollable page area so the keyboard can push content (and the
+  // Save/Post Ride button) up instead of covering it.
+  mainFlexWrap: {
+    flex: 1,
+  },
+
+  // Full-ride indicators
+  seatBadgeFull: {
+    backgroundColor: '#FDECEC',
+  },
+  seatBadgeTextFull: {
+    color: '#D64545',
+  },
+  fullPill: {
+    backgroundColor: '#FDECEC',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+  },
+  fullPillText: {
+    color: '#D64545',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  yourRideTag: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#3B6EF5',
+    marginBottom: 2,
+  },
+
+  // Self-service "Leave" / "Remove" buttons on a rider's own chip
+  riderChipLeaveButton: {
+    marginLeft: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: '#FDECEC',
+  },
+  riderChipLeaveText: {
+    color: '#D64545',
+    fontSize: 11.5,
+    fontWeight: '700',
   },
 });
