@@ -15,6 +15,11 @@ import {
   View,
 } from 'react-native';
 
+// Basic email shape check (not full RFC 5322 validation): local part, "@",
+// domain, a dot, and a TLD, no spaces. Enough to reject obviously invalid
+// addresses without a validation library.
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // This is the home screen for CarpoolBoard.
 // Drivers can be added (with a name and seat count), riders can ask for a ride,
 // and a waiting rider can be matched to a driver's open seat.
@@ -35,17 +40,23 @@ export default function App() {
   // pendingRequests collects { id, riderId, name } for requests the driver hasn't answered yet.
   const [drivers, setDrivers] = useState([]);
 
-  // Local accounts for this device: { id, name, role }. There is no backend,
-  // so "signing up" just remembers a name + role for the session, and
-  // "logging in" again with the same name reuses that same account. This is
-  // the seam a real auth system would slot into later.
+  // Local accounts for this device: { id, name, email, role }. This is a
+  // prototype, NOT secure production authentication — there's no password,
+  // no backend, and everything lives only in this session's React state.
+  // The email is the account's identifier (case-insensitive): "signing up"
+  // remembers a name + email + role, and "logging in" again with the same
+  // email reuses that same account and its original role. That's the seam a
+  // real auth/persistence layer would slot into later without changing how
+  // the rest of the app reads `currentUser`.
   const [accounts, setAccounts] = useState([]);
 
   // The id of the account currently signed in, or null when signed out.
   const [currentUserId, setCurrentUserId] = useState(null);
 
-  // The current text typed into the sign-in form, and the role toggle.
+  // The current text typed into the sign-in form, and the role toggle. Name
+  // and role are only used when the email doesn't match an existing account.
   const [authNameInput, setAuthNameInput] = useState('');
+  const [authEmailInput, setAuthEmailInput] = useState('');
   const [authRole, setAuthRole] = useState('driver');
   const [authError, setAuthError] = useState('');
 
@@ -87,6 +98,13 @@ export default function App() {
   // The id of the driver currently picking a waiting rider to match with, or null if none.
   const [reservingDriverId, setReservingDriverId] = useState(null);
 
+  // The optional message a rider types to explain why they need a ride,
+  // shown to the driver alongside their Pending request.
+  const [requestReasonInput, setRequestReasonInput] = useState('');
+
+  // Whether the signed-in user's Account/Profile screen is currently showing.
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+
   // Details of the most recently confirmed match, or null when no confirmation is showing.
   // Shape: { riderName, driverName, destination, departureTime }.
   const [matchConfirmation, setMatchConfirmation] = useState(null);
@@ -97,29 +115,54 @@ export default function App() {
   // The signed-in account, or null when nobody is signed in yet.
   const currentUser = accounts.find((account) => account.id === currentUserId) || null;
 
-  // Runs when the user presses "Continue" on the sign-in screen. A name that
-  // matches an existing account logs back into it (keeping its original
-  // role); a new name creates a new local account with the chosen role.
+  // Live-matches the sign-in email field against existing accounts, so the
+  // form can show a "welcome back" notice and skip the name/role fields
+  // before the user even presses Continue.
+  const trimmedAuthEmail = authEmailInput.trim().toLowerCase();
+  const matchingAuthAccount = trimmedAuthEmail
+    ? accounts.find((account) => account.email.toLowerCase() === trimmedAuthEmail) || null
+    : null;
+
+  // Runs when the user presses "Continue" on the sign-in screen. An email
+  // that matches an existing account logs back into it (keeping the name and
+  // role on file); a new email requires a name and role to create a new
+  // local account. Email (not name) is the account identifier.
   function handleSignIn() {
     const trimmedName = authNameInput.trim();
-    if (trimmedName === '') {
-      setAuthError('Please enter your name.');
+    const trimmedEmail = authEmailInput.trim();
+
+    if (trimmedEmail === '') {
+      setAuthError('Please enter your email address.');
+      return;
+    }
+    if (!EMAIL_PATTERN.test(trimmedEmail)) {
+      setAuthError('Please enter a valid email address.');
       return;
     }
 
     const existingAccount = accounts.find(
-      (account) => account.name.toLowerCase() === trimmedName.toLowerCase()
+      (account) => account.email.toLowerCase() === trimmedEmail.toLowerCase()
     );
 
     if (existingAccount) {
       setCurrentUserId(existingAccount.id);
     } else {
-      const newAccount = { id: Date.now(), name: trimmedName, role: authRole };
-      setAccounts([...accounts, newAccount]);
+      if (trimmedName === '') {
+        setAuthError('Please enter your name.');
+        return;
+      }
+      const newAccount = {
+        id: Date.now(),
+        name: trimmedName,
+        email: trimmedEmail,
+        role: authRole,
+      };
+      setAccounts((current) => [...current, newAccount]);
       setCurrentUserId(newAccount.id);
     }
 
     setAuthNameInput('');
+    setAuthEmailInput('');
     setAuthError('');
   }
 
@@ -132,6 +175,21 @@ export default function App() {
     setSelectedRideDriverId(null);
     setReservingDriverId(null);
     setRequestNotice('');
+    setIsProfileOpen(false);
+  }
+
+  // Opens the signed-in user's Account/Profile screen, closing any open ride
+  // details/matching first so the two screens can't overlap.
+  function handleOpenProfile() {
+    setSelectedRideDriverId(null);
+    setReservingDriverId(null);
+    setRequestNotice('');
+    setIsProfileOpen(true);
+  }
+
+  // Closes the Account/Profile screen and returns to the dashboard.
+  function handleCloseProfile() {
+    setIsProfileOpen(false);
   }
 
   // Opens the Add Driver form, pre-filled with the signed-in driver's name.
@@ -247,21 +305,24 @@ export default function App() {
     );
   }
 
-  // Opens (or closes, if already open) the waiting-rider picker for a driver.
-  // This is the Ride Details -> Rider Matching step.
+  // Opens (or closes, if already open) the request-confirm panel for a
+  // driver, clearing any reason text left over from a different ride.
   function handleStartReserve(driverId) {
     setReservingDriverId((currentId) => (currentId === driverId ? null : driverId));
+    setRequestReasonInput('');
   }
 
-  // Closes the waiting-rider picker without matching anyone.
+  // Closes the request-confirm panel without sending a request.
   function handleCancelReserve() {
     setReservingDriverId(null);
+    setRequestReasonInput('');
   }
 
-  // SPIKE, step 1: a waiting rider requests this specific ride.
-  // The request is stored on the driver as Pending. Seats do NOT change yet,
-  // and the rider stays in the waiting list (they could still request other rides).
-  function handleRequestRide(driverId, riderId) {
+  // SPIKE, step 1: a waiting rider requests this specific ride, optionally
+  // with a short reason so the driver has context when deciding. The request
+  // is stored on the driver as Pending. Seats do NOT change yet, and the
+  // rider stays in the waiting list (they could still request other rides).
+  function handleRequestRide(driverId, riderId, reason) {
     const driver = drivers.find((d) => d.id === driverId);
     const rider = riders.find((r) => r.id === riderId);
     if (!driver || !rider) {
@@ -281,13 +342,19 @@ export default function App() {
       return;
     }
 
-    const newRequest = { id: Date.now(), riderId: rider.id, name: rider.name };
+    const newRequest = {
+      id: Date.now(),
+      riderId: rider.id,
+      name: rider.name,
+      reason: reason ? reason.trim() : '',
+    };
     setDrivers(
       drivers.map((d) =>
         d.id === driverId ? { ...d, pendingRequests: [...d.pendingRequests, newRequest] } : d
       )
     );
     setReservingDriverId(null);
+    setRequestReasonInput('');
     setRequestNotice(`${rider.name}'s request is now Pending.`);
   }
 
@@ -484,8 +551,9 @@ export default function App() {
 
   if (currentUser === null) {
     // Sign-in screen: local-only accounts, no networking or persistence yet.
-    // Picking a name + role here is what a real login would set up; the rest
-    // of the app just reads currentUser.role to decide what to show.
+    // Email is the account identifier; picking a name + role only applies
+    // the first time an email is used. The rest of the app just reads
+    // currentUser.role to decide what to show.
     return (
       <SafeAreaView style={styles.safeArea}>
         <StatusBar style="light" />
@@ -507,56 +575,83 @@ export default function App() {
               </View>
 
               <View style={styles.authCard}>
-                <Text style={styles.authLabel}>Your name</Text>
+                <Text style={styles.authLabel}>Email</Text>
                 <TextInput
                   style={styles.input}
-                  placeholder="e.g. Jordan Smith"
+                  placeholder="e.g. jordan@example.edu"
                   placeholderTextColor="#9AA3B2"
-                  value={authNameInput}
-                  onChangeText={setAuthNameInput}
+                  value={authEmailInput}
+                  onChangeText={setAuthEmailInput}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  autoCorrect={false}
                   returnKeyType="done"
                   onSubmitEditing={Keyboard.dismiss}
                 />
 
-                <Text style={styles.authLabel}>I am a...</Text>
-                <View style={styles.roleToggleRow}>
-                  <TouchableOpacity
-                    style={[
-                      styles.roleToggleButton,
-                      authRole === 'driver' && styles.roleToggleButtonActiveDriver,
-                    ]}
-                    onPress={() => setAuthRole('driver')}
-                    activeOpacity={0.85}
-                  >
-                    <Text
-                      style={[
-                        styles.roleToggleText,
-                        authRole === 'driver' && styles.roleToggleTextActive,
-                      ]}
-                    >
-                      Driver
+                {matchingAuthAccount ? (
+                  <View style={styles.authReturningNotice}>
+                    <Text style={styles.authReturningNoticeText}>
+                      Welcome back, {matchingAuthAccount.name}! You'll log back in as{' '}
+                      {matchingAuthAccount.role === 'driver' ? 'a Driver' : 'a Rider'}.
                     </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[
-                      styles.roleToggleButton,
-                      authRole === 'rider' && styles.roleToggleButtonActiveRider,
-                    ]}
-                    onPress={() => setAuthRole('rider')}
-                    activeOpacity={0.85}
-                  >
-                    <Text
-                      style={[
-                        styles.roleToggleText,
-                        authRole === 'rider' && styles.roleToggleTextActive,
-                      ]}
-                    >
-                      Rider
-                    </Text>
-                  </TouchableOpacity>
-                </View>
+                  </View>
+                ) : (
+                  <>
+                    <Text style={styles.authLabel}>Your name</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="e.g. Jordan Smith"
+                      placeholderTextColor="#9AA3B2"
+                      value={authNameInput}
+                      onChangeText={setAuthNameInput}
+                      returnKeyType="done"
+                      onSubmitEditing={Keyboard.dismiss}
+                    />
+
+                    <Text style={styles.authLabel}>I am a...</Text>
+                    <View style={styles.roleToggleRow}>
+                      <TouchableOpacity
+                        style={[
+                          styles.roleToggleButton,
+                          authRole === 'driver' && styles.roleToggleButtonActiveDriver,
+                        ]}
+                        onPress={() => setAuthRole('driver')}
+                        activeOpacity={0.85}
+                      >
+                        <Text
+                          style={[
+                            styles.roleToggleText,
+                            authRole === 'driver' && styles.roleToggleTextActive,
+                          ]}
+                        >
+                          Driver
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[
+                          styles.roleToggleButton,
+                          authRole === 'rider' && styles.roleToggleButtonActiveRider,
+                        ]}
+                        onPress={() => setAuthRole('rider')}
+                        activeOpacity={0.85}
+                      >
+                        <Text
+                          style={[
+                            styles.roleToggleText,
+                            authRole === 'rider' && styles.roleToggleTextActive,
+                          ]}
+                        >
+                          Rider
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  </>
+                )}
+
                 <Text style={styles.authHint}>
-                  Already signed up? Enter the same name to log back in with your existing role.
+                  New here? Enter your name and pick a role. Already signed up? Just enter the
+                  same email — your name and role are saved with it.
                 </Text>
 
                 {authError !== '' && <Text style={styles.errorText}>{authError}</Text>}
@@ -568,6 +663,12 @@ export default function App() {
                 >
                   <Text style={styles.buttonText}>Continue</Text>
                 </TouchableOpacity>
+
+                <Text style={styles.authDisclaimer}>
+                  This is a class-project prototype login: accounts are kept only in this app's
+                  memory for this session, with no password and no real security. Don't use a
+                  real/sensitive password anywhere here.
+                </Text>
               </View>
             </ScrollView>
           </TouchableWithoutFeedback>
@@ -606,7 +707,18 @@ export default function App() {
               {currentUser.role === 'driver' ? 'Driver' : 'Rider'}
             </Text>
           </View>
-          <TouchableOpacity onPress={handleSignOut} activeOpacity={0.7}>
+          <TouchableOpacity
+            onPress={handleOpenProfile}
+            activeOpacity={0.7}
+            style={styles.accountActionButton}
+          >
+            <Text style={styles.profileLinkText}>Profile</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={handleSignOut}
+            activeOpacity={0.7}
+            style={styles.accountActionButton}
+          >
             <Text style={styles.logOutText}>Log Out</Text>
           </TouchableOpacity>
         </View>
@@ -761,6 +873,11 @@ export default function App() {
                       <View style={styles.pendingInfo}>
                         <Text style={styles.riderPickName}>{request.name}</Text>
                         <Text style={styles.pendingStatus}>Pending</Text>
+                        {request.reason ? (
+                          <Text style={styles.pendingReasonText} numberOfLines={2}>
+                            “{request.reason}”
+                          </Text>
+                        ) : null}
                       </View>
                       {isOwnerDriver && (
                         <>
@@ -841,9 +958,23 @@ export default function App() {
                       Send this request as {currentUser.name}. The driver will accept or deny it.
                     </Text>
 
+                    <TextInput
+                      style={[styles.input, styles.reasonInput]}
+                      placeholder='Optional: why do you need this ride? (e.g. "Going to campus")'
+                      placeholderTextColor="#9AA3B2"
+                      value={requestReasonInput}
+                      onChangeText={setRequestReasonInput}
+                      multiline
+                      numberOfLines={2}
+                      maxLength={140}
+                      returnKeyType="done"
+                      blurOnSubmit
+                      onSubmitEditing={Keyboard.dismiss}
+                    />
+
                     <TouchableOpacity
                       style={styles.saveRiderButton}
-                      onPress={() => handleRequestRide(detailsDriver.id, currentUser.id)}
+                      onPress={() => handleRequestRide(detailsDriver.id, currentUser.id, requestReasonInput)}
                       activeOpacity={0.85}
                     >
                       <Text style={styles.buttonText}>Confirm Request</Text>
@@ -918,6 +1049,73 @@ export default function App() {
                   <Text style={styles.cancelRideButtonText}>Cancel Ride</Text>
                 </TouchableOpacity>
               )}
+            </View>
+          </View>
+        ) : isProfileOpen ? (
+          /* Account/Profile screen: name, email, role, and log out. */
+          <View style={styles.detailsWrap}>
+            <View style={styles.detailsCard}>
+              <TouchableOpacity
+                style={styles.detailsBackRow}
+                onPress={handleCloseProfile}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.detailsBackArrow}>‹</Text>
+                <Text style={styles.detailsBackText}>Available Rides</Text>
+              </TouchableOpacity>
+
+              <View style={styles.detailsHeaderRow}>
+                <View style={styles.avatarRing}>
+                  <View style={styles.avatar}>
+                    <Text style={styles.avatarText}>{getInitial(currentUser.name)}</Text>
+                  </View>
+                </View>
+                <View style={styles.detailsHeaderText}>
+                  <Text style={styles.detailsDriverName}>{currentUser.name}</Text>
+                  <Text style={styles.detailsHeaderHint}>Account</Text>
+                </View>
+              </View>
+
+              <View style={styles.confirmationDetailsBox}>
+                <View style={styles.confirmationDetailRow}>
+                  <Text style={styles.confirmationDetailLabel}>Name</Text>
+                  <Text style={styles.confirmationDetailValue}>{currentUser.name}</Text>
+                </View>
+                <View style={styles.confirmationDetailDivider} />
+                <View style={styles.confirmationDetailRow}>
+                  <Text style={styles.confirmationDetailLabel}>Email</Text>
+                  <Text style={styles.confirmationDetailValue}>{currentUser.email}</Text>
+                </View>
+                <View style={styles.confirmationDetailDivider} />
+                <View style={styles.confirmationDetailRow}>
+                  <Text style={styles.confirmationDetailLabel}>Role</Text>
+                  <View
+                    style={[
+                      styles.roleBadge,
+                      currentUser.role === 'driver'
+                        ? styles.roleBadgeInlineDriver
+                        : styles.roleBadgeInlineRider,
+                    ]}
+                  >
+                    <Text style={styles.roleBadgeText}>
+                      {currentUser.role === 'driver' ? 'Driver' : 'Rider'}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+
+              <Text style={styles.authDisclaimer}>
+                This account is a local class-project prototype: it lives only in this app's
+                memory for this session, with no password or real authentication yet.
+              </Text>
+
+              <TouchableOpacity
+                style={styles.cancelRideButton}
+                onPress={handleSignOut}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.cancelRideButtonText}>Log Out</Text>
+              </TouchableOpacity>
             </View>
           </View>
         ) : (
@@ -1546,6 +1744,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#F2994A',
   },
+  pendingReasonText: {
+    fontSize: 12.5,
+    fontStyle: 'italic',
+    color: '#5B6472',
+    marginTop: 2,
+  },
   acceptButton: {
     backgroundColor: '#3B6EF5',
     borderRadius: 999,
@@ -1777,6 +1981,10 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 12,
   },
+  reasonInput: {
+    minHeight: 64,
+    textAlignVertical: 'top',
+  },
 
   saveDriverButton: {
     backgroundColor: '#3B6EF5',
@@ -1855,6 +2063,26 @@ const styles = StyleSheet.create({
     color: '#8A93A3',
     marginBottom: 16,
   },
+  authReturningNotice: {
+    backgroundColor: '#EEF3FF',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#D6E2FE',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 12,
+  },
+  authReturningNoticeText: {
+    fontSize: 13.5,
+    fontWeight: '600',
+    color: '#16213E',
+  },
+  authDisclaimer: {
+    fontSize: 11.5,
+    color: '#8A93A3',
+    marginTop: 4,
+    lineHeight: 16,
+  },
   roleToggleRow: {
     flexDirection: 'row',
     gap: 10,
@@ -1915,6 +2143,24 @@ const styles = StyleSheet.create({
   },
   roleBadgeText: {
     fontSize: 11,
+    fontWeight: '700',
+    color: '#fff',
+  },
+  // Solid-color variant for use on light (white card) backgrounds, like the
+  // Profile screen, where the header's semi-transparent tint reads too pale.
+  roleBadgeInlineDriver: {
+    backgroundColor: '#3B6EF5',
+    marginRight: 0,
+  },
+  roleBadgeInlineRider: {
+    backgroundColor: '#F2994A',
+    marginRight: 0,
+  },
+  accountActionButton: {
+    marginLeft: 10,
+  },
+  profileLinkText: {
+    fontSize: 12.5,
     fontWeight: '700',
     color: '#fff',
   },
